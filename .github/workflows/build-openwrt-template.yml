@@ -119,7 +119,7 @@ jobs:
           echo "Resolved OpenWrt version: ${VERSION}"
           echo "Image URL: ${IMAGE_URL}"
 
-      - name: Download and verify OpenWrt image
+            - name: Download and verify OpenWrt image
         shell: bash
         run: |
           set -euxo pipefail
@@ -127,13 +127,30 @@ jobs:
           mkdir -p build dist
           cd build
 
-          curl -fL -o "${{ steps.resolve.outputs.image_name }}" "${{ steps.resolve.outputs.image_url }}"
-          curl -fL -o sha256sums "${{ steps.resolve.outputs.sha256sums_url }}"
+          IMAGE_NAME="${{ steps.resolve.outputs.image_name }}"
+          IMAGE_URL="${{ steps.resolve.outputs.image_url }}"
+          SHA256SUMS_URL="${{ steps.resolve.outputs.sha256sums_url }}"
 
-          grep " ${{ steps.resolve.outputs.image_name }}\$" sha256sums > image.sha256
+          curl -fL -o "${IMAGE_NAME}" "${IMAGE_URL}"
+          curl -fL -o sha256sums "${SHA256SUMS_URL}"
+
+          EXPECTED_SHA256="$(
+            awk -v file="${IMAGE_NAME}" '
+              $2 == file || $2 == "*" file {
+                print $1
+                found=1
+                exit
+              }
+              END {
+                if (!found) exit 1
+              }
+            ' sha256sums
+          )"
+
+          printf '%s  %s\n' "${EXPECTED_SHA256}" "${IMAGE_NAME}" > image.sha256
           sha256sum -c image.sha256
 
-          gzip -dk "${{ steps.resolve.outputs.image_name }}"
+          gzip -dk "${IMAGE_NAME}"
 
       - name: Prepare disk image
         id: disk
