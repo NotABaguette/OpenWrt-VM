@@ -48,6 +48,7 @@ jobs:
 
     steps:
       - name: Install build dependencies
+        shell: bash
         run: |
           set -euxo pipefail
           sudo apt-get update
@@ -61,16 +62,22 @@ jobs:
             tar \
             xorriso \
             jq \
-            libxml2-utils
+            libxml2-utils \
+            python3
 
       - name: Resolve OpenWrt version and image
         id: resolve
         shell: bash
+        env:
+          INPUT_OPENWRT_VERSION: ${{ inputs.openwrt_version }}
+          INPUT_IMAGE_VARIANT: ${{ inputs.image_variant }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
         run: |
           set -euo pipefail
 
-          REQUESTED_VERSION="${{ github.event.inputs.openwrt_version || 'latest' }}"
-          IMAGE_VARIANT="${{ github.event.inputs.image_variant || 'efi' }}"
+          REQUESTED_VERSION="${INPUT_OPENWRT_VERSION:-latest}"
+          IMAGE_VARIANT="${INPUT_IMAGE_VARIANT:-efi}"
+          PRERELEASE="${INPUT_PRERELEASE:-false}"
 
           if [[ "${REQUESTED_VERSION}" == "latest" ]]; then
             VERSION="$(
@@ -115,11 +122,12 @@ jobs:
           echo "image_url=${IMAGE_URL}" >> "${GITHUB_OUTPUT}"
           echo "sha256sums_url=${SHA256SUMS_URL}" >> "${GITHUB_OUTPUT}"
           echo "boot_mode=${BOOT_MODE}" >> "${GITHUB_OUTPUT}"
+          echo "prerelease=${PRERELEASE}" >> "${GITHUB_OUTPUT}"
 
           echo "Resolved OpenWrt version: ${VERSION}"
           echo "Image URL: ${IMAGE_URL}"
 
-            - name: Download and verify OpenWrt image
+      - name: Download and verify OpenWrt image
         shell: bash
         run: |
           set -euxo pipefail
@@ -155,12 +163,14 @@ jobs:
       - name: Prepare disk image
         id: disk
         shell: bash
+        env:
+          INPUT_DISK_SIZE: ${{ inputs.disk_size }}
         run: |
           set -euxo pipefail
 
           VERSION="${{ steps.resolve.outputs.version }}"
           BOOT_MODE="${{ steps.resolve.outputs.boot_mode }}"
-          DISK_SIZE="${{ github.event.inputs.disk_size || '4G' }}"
+          DISK_SIZE="${INPUT_DISK_SIZE:-4G}"
 
           IMG_GZ="build/${{ steps.resolve.outputs.image_name }}"
           IMG="${IMG_GZ%.gz}"
@@ -200,20 +210,22 @@ jobs:
           VMDK_SIZE_BYTES="${{ steps.disk.outputs.vmdk_size_bytes }}"
 
           VM_NAME="openwrt-${VERSION}-x86-64-${BOOT_MODE}"
-          OVF="dist/${VM_NAME}.ovf"
+          OVF_PATH="dist/${VM_NAME}.ovf"
           VMDK_FILE="${VM_NAME}.vmdk"
 
-          FIRMWARE_ITEM=""
-          if [[ "${BOOT_MODE}" == "efi" ]]; then
-            FIRMWARE_ITEM="$(cat <<'EOF_FIRMWARE'
-                <vmw:Config ovf:required="false" vmw:key="firmware" vmw:value="efi"/>
-                <vmw:Config ovf:required="false" vmw:key="secureBootEnabled" vmw:value="false"/>
-          EOF_FIRMWARE
-          )"
-          fi
+          python3 - "${OVF_PATH}" "${VM_NAME}" "${VMDK_FILE}" "${VIRTUAL_SIZE_BYTES}" "${VMDK_SIZE_BYTES}" "${BOOT_MODE}" <<'PY'
+          import sys
+          from pathlib import Path
 
-          cat > "${OVF}" <<EOF_OVF
-          <?xml version="1.0" encoding="UTF-8"?>
+          ovf_path, vm_name, vmdk_file, virtual_size, vmdk_size, boot_mode = sys.argv[1:7]
+
+          firmware = ""
+          if boot_mode == "efi":
+              firmware = """
+                <vmw:Config ovf:required="false" vmw:key="firmware" vmw:value="efi"/>
+                <vmw:Config ovf:required="false" vmw:key="secureBootEnabled" vmw:value="false"/>"""
+
+          ovf = f"""<?xml version="1.0" encoding="UTF-8"?>
           <Envelope
             vmw:buildId="build-000000"
             xmlns="http://schemas.dmtf.org/ovf/envelope/1"
@@ -225,13 +237,13 @@ jobs:
             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
 
             <References>
-              <File ovf:id="file1" ovf:href="${VMDK_FILE}" ovf:size="${VMDK_SIZE_BYTES}"/>
+              <File ovf:id="file1" ovf:href="{vmdk_file}" ovf:size="{vmdk_size}"/>
             </References>
 
             <DiskSection>
               <Info>Virtual disk information</Info>
               <Disk
-                ovf:capacity="${VIRTUAL_SIZE_BYTES}"
+                ovf:capacity="{virtual_size}"
                 ovf:capacityAllocationUnits="byte"
                 ovf:diskId="vmdisk1"
                 ovf:fileRef="file1"
@@ -245,9 +257,9 @@ jobs:
               </Network>
             </NetworkSection>
 
-            <VirtualSystem ovf:id="${VM_NAME}">
+            <VirtualSystem ovf:id="{vm_name}">
               <Info>OpenWrt x86/64 VMware template</Info>
-              <Name>${VM_NAME}</Name>
+              <Name>{vm_name}</Name>
 
               <OperatingSystemSection ovf:id="101" vmw:osType="other4xLinux64Guest">
                 <Info>Guest operating system</Info>
@@ -260,7 +272,7 @@ jobs:
                 <System>
                   <vssd:ElementName>Virtual Hardware Family</vssd:ElementName>
                   <vssd:InstanceID>0</vssd:InstanceID>
-                  <vssd:VirtualSystemIdentifier>${VM_NAME}</vssd:VirtualSystemIdentifier>
+                  <vssd:VirtualSystemIdentifier>{vm_name}</vssd:VirtualSystemIdentifier>
                   <vssd:VirtualSystemType>vmx-14</vssd:VirtualSystemType>
                 </System>
 
@@ -309,14 +321,17 @@ jobs:
                   <rasd:InstanceID>5</rasd:InstanceID>
                   <rasd:ResourceSubType>E1000e</rasd:ResourceSubType>
                   <rasd:ResourceType>10</rasd:ResourceType>
-                </Item>
-          ${FIRMWARE_ITEM}
+                </Item>{firmware}
+
               </VirtualHardwareSection>
             </VirtualSystem>
           </Envelope>
-          EOF_OVF
+          """
 
-          xmllint --noout "${OVF}"
+          Path(ovf_path).write_text(ovf, encoding="utf-8")
+          PY
+
+          xmllint --noout "${OVF_PATH}"
 
       - name: Package OVA, ISO bundle, metadata, and checksums
         id: package
@@ -332,14 +347,17 @@ jobs:
 
           cd dist
 
-          sha256sum "${VM_NAME}.ovf" "${VM_NAME}.vmdk" > "${VM_NAME}.mf"
+          {
+            sha1sum "${VM_NAME}.ovf" | awk '{print "SHA1(" $2 ")= " $1}'
+            sha1sum "${VM_NAME}.vmdk" | awk '{print "SHA1(" $2 ")= " $1}'
+          } > "${VM_NAME}.mf"
 
           tar -cvf "${VM_NAME}.ova" \
             "${VM_NAME}.ovf" \
-            "${VM_NAME}.vmdk" \
-            "${VM_NAME}.mf"
+            "${VM_NAME}.mf" \
+            "${VM_NAME}.vmdk"
 
-          cat > "metadata.json" <<EOF_METADATA
+          cat > metadata.json <<EOF_METADATA
           {
             "name": "${VM_NAME}",
             "openwrt_version": "${VERSION}",
@@ -361,17 +379,17 @@ jobs:
             -volid "OPENWRT_OVF" \
             -output "${VM_NAME}-bundle.iso" \
             "${VM_NAME}.ovf" \
-            "${VM_NAME}.vmdk" \
             "${VM_NAME}.mf" \
-            "metadata.json"
+            "${VM_NAME}.vmdk" \
+            metadata.json
 
           sha256sum \
             "${VM_NAME}.ovf" \
-            "${VM_NAME}.vmdk" \
             "${VM_NAME}.mf" \
+            "${VM_NAME}.vmdk" \
             "${VM_NAME}.ova" \
             "${VM_NAME}-bundle.iso" \
-            "metadata.json" \
+            metadata.json \
             > SHA256SUMS
 
           echo "vm_name=${VM_NAME}" >> "${GITHUB_OUTPUT}"
@@ -429,5 +447,6 @@ jobs:
             dist/metadata.json
             dist/SHA256SUMS
           draft: false
-          prerelease: ${{ github.event.inputs.prerelease || false }}
+          prerelease: ${{ steps.resolve.outputs.prerelease }}
           fail_on_unmatched_files: true
+          overwrite_files: true
