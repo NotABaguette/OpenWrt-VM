@@ -1,0 +1,416 @@
+name: Build OpenWrt VMware Template
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: "OpenWrt version to build, or 'latest'"
+        required: true
+        default: "latest"
+        type: string
+      image_variant:
+        description: "OpenWrt x86/64 image variant"
+        required: true
+        default: "efi"
+        type: choice
+        options:
+          - efi
+          - bios
+      disk_size:
+        description: "Expanded virtual disk size, for example 1G, 2G, 4G, 8G. Use 0 to keep original size."
+        required: true
+        default: "4G"
+        type: string
+      prerelease:
+        description: "Mark GitHub Release as prerelease"
+        required: true
+        default: false
+        type: boolean
+
+  schedule:
+    - cron: "0 3 * * 0"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: openwrt-template-release
+  cancel-in-progress: false
+
+env:
+  OPENWRT_BASE_URL: https://downloads.openwrt.org/releases
+  TARGET: x86/64
+
+jobs:
+  build:
+    name: Build OpenWrt VMware OVF/OVA assets
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            curl \
+            ca-certificates \
+            gzip \
+            qemu-utils \
+            coreutils \
+            util-linux \
+            tar \
+            xorriso \
+            jq \
+            libxml2-utils
+
+      - name: Resolve OpenWrt version and image
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REQUESTED_VERSION="${{ github.event.inputs.openwrt_version || 'latest' }}"
+          IMAGE_VARIANT="${{ github.event.inputs.image_variant || 'efi' }}"
+
+          if [[ "${REQUESTED_VERSION}" == "latest" ]]; then
+            VERSION="$(
+              curl -fsSL "${OPENWRT_BASE_URL}/" \
+                | grep -oE 'href="[0-9]+\.[0-9]+\.[0-9]+/' \
+                | sed -E 's#href="([^/]+)/#\1#' \
+                | sort -V \
+                | tail -n 1
+            )"
+          else
+            VERSION="${REQUESTED_VERSION}"
+          fi
+
+          if [[ -z "${VERSION}" ]]; then
+            echo "Failed to resolve OpenWrt version." >&2
+            exit 1
+          fi
+
+          TARGET_URL="${OPENWRT_BASE_URL}/${VERSION}/targets/${TARGET}"
+
+          case "${IMAGE_VARIANT}" in
+            efi)
+              IMAGE_NAME="openwrt-${VERSION}-x86-64-generic-ext4-combined-efi.img.gz"
+              BOOT_MODE="efi"
+              ;;
+            bios)
+              IMAGE_NAME="openwrt-${VERSION}-x86-64-generic-ext4-combined.img.gz"
+              BOOT_MODE="bios"
+              ;;
+            *)
+              echo "Unsupported image_variant: ${IMAGE_VARIANT}" >&2
+              exit 1
+              ;;
+          esac
+
+          IMAGE_URL="${TARGET_URL}/${IMAGE_NAME}"
+          SHA256SUMS_URL="${TARGET_URL}/sha256sums"
+
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "target_url=${TARGET_URL}" >> "${GITHUB_OUTPUT}"
+          echo "image_name=${IMAGE_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "image_url=${IMAGE_URL}" >> "${GITHUB_OUTPUT}"
+          echo "sha256sums_url=${SHA256SUMS_URL}" >> "${GITHUB_OUTPUT}"
+          echo "boot_mode=${BOOT_MODE}" >> "${GITHUB_OUTPUT}"
+
+          echo "Resolved OpenWrt version: ${VERSION}"
+          echo "Image URL: ${IMAGE_URL}"
+
+      - name: Download and verify OpenWrt image
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p build dist
+          cd build
+
+          curl -fL -o "${{ steps.resolve.outputs.image_name }}" "${{ steps.resolve.outputs.image_url }}"
+          curl -fL -o sha256sums "${{ steps.resolve.outputs.sha256sums_url }}"
+
+          grep " ${{ steps.resolve.outputs.image_name }}\$" sha256sums > image.sha256
+          sha256sum -c image.sha256
+
+          gzip -dk "${{ steps.resolve.outputs.image_name }}"
+
+      - name: Prepare disk image
+        id: disk
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          VERSION="${{ steps.resolve.outputs.version }}"
+          BOOT_MODE="${{ steps.resolve.outputs.boot_mode }}"
+          DISK_SIZE="${{ github.event.inputs.disk_size || '4G' }}"
+
+          IMG_GZ="build/${{ steps.resolve.outputs.image_name }}"
+          IMG="${IMG_GZ%.gz}"
+
+          RAW="build/openwrt-${VERSION}-x86-64-${BOOT_MODE}.raw"
+          cp "${IMG}" "${RAW}"
+
+          if [[ "${DISK_SIZE}" != "0" && "${DISK_SIZE}" != "0G" ]]; then
+            qemu-img resize -f raw "${RAW}" "${DISK_SIZE}"
+          fi
+
+          VMDK="dist/openwrt-${VERSION}-x86-64-${BOOT_MODE}.vmdk"
+
+          qemu-img convert \
+            -f raw \
+            -O vmdk \
+            -o subformat=streamOptimized,adapter_type=lsilogic \
+            "${RAW}" \
+            "${VMDK}"
+
+          VIRTUAL_SIZE_BYTES="$(qemu-img info --output=json "${RAW}" | jq -r '."virtual-size"')"
+          VMDK_SIZE_BYTES="$(stat -c '%s' "${VMDK}")"
+
+          echo "raw=${RAW}" >> "${GITHUB_OUTPUT}"
+          echo "vmdk=${VMDK}" >> "${GITHUB_OUTPUT}"
+          echo "virtual_size_bytes=${VIRTUAL_SIZE_BYTES}" >> "${GITHUB_OUTPUT}"
+          echo "vmdk_size_bytes=${VMDK_SIZE_BYTES}" >> "${GITHUB_OUTPUT}"
+
+      - name: Generate OVF descriptor
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          VERSION="${{ steps.resolve.outputs.version }}"
+          BOOT_MODE="${{ steps.resolve.outputs.boot_mode }}"
+          VIRTUAL_SIZE_BYTES="${{ steps.disk.outputs.virtual_size_bytes }}"
+          VMDK_SIZE_BYTES="${{ steps.disk.outputs.vmdk_size_bytes }}"
+
+          VM_NAME="openwrt-${VERSION}-x86-64-${BOOT_MODE}"
+          OVF="dist/${VM_NAME}.ovf"
+          VMDK_FILE="${VM_NAME}.vmdk"
+
+          FIRMWARE_ITEM=""
+          if [[ "${BOOT_MODE}" == "efi" ]]; then
+            FIRMWARE_ITEM="$(cat <<'EOF_FIRMWARE'
+                <vmw:Config ovf:required="false" vmw:key="firmware" vmw:value="efi"/>
+                <vmw:Config ovf:required="false" vmw:key="secureBootEnabled" vmw:value="false"/>
+          EOF_FIRMWARE
+          )"
+          fi
+
+          cat > "${OVF}" <<EOF_OVF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <Envelope
+            vmw:buildId="build-000000"
+            xmlns="http://schemas.dmtf.org/ovf/envelope/1"
+            xmlns:cim="http://schemas.dmtf.org/wbem/wscim/1/common"
+            xmlns:ovf="http://schemas.dmtf.org/ovf/envelope/1"
+            xmlns:rasd="http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_ResourceAllocationSettingData"
+            xmlns:vmw="http://www.vmware.com/schema/ovf"
+            xmlns:vssd="http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_VirtualSystemSettingData"
+            xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+
+            <References>
+              <File ovf:id="file1" ovf:href="${VMDK_FILE}" ovf:size="${VMDK_SIZE_BYTES}"/>
+            </References>
+
+            <DiskSection>
+              <Info>Virtual disk information</Info>
+              <Disk
+                ovf:capacity="${VIRTUAL_SIZE_BYTES}"
+                ovf:capacityAllocationUnits="byte"
+                ovf:diskId="vmdisk1"
+                ovf:fileRef="file1"
+                ovf:format="http://www.vmware.com/interfaces/specifications/vmdk.html#streamOptimized"/>
+            </DiskSection>
+
+            <NetworkSection>
+              <Info>Network information</Info>
+              <Network ovf:name="LAN">
+                <Description>OpenWrt LAN / management network</Description>
+              </Network>
+            </NetworkSection>
+
+            <VirtualSystem ovf:id="${VM_NAME}">
+              <Info>OpenWrt x86/64 VMware template</Info>
+              <Name>${VM_NAME}</Name>
+
+              <OperatingSystemSection ovf:id="101" vmw:osType="other4xLinux64Guest">
+                <Info>Guest operating system</Info>
+                <Description>Other Linux 4.x or later kernel 64-bit</Description>
+              </OperatingSystemSection>
+
+              <VirtualHardwareSection>
+                <Info>Virtual hardware requirements</Info>
+
+                <System>
+                  <vssd:ElementName>Virtual Hardware Family</vssd:ElementName>
+                  <vssd:InstanceID>0</vssd:InstanceID>
+                  <vssd:VirtualSystemIdentifier>${VM_NAME}</vssd:VirtualSystemIdentifier>
+                  <vssd:VirtualSystemType>vmx-14</vssd:VirtualSystemType>
+                </System>
+
+                <Item>
+                  <rasd:AllocationUnits>hertz * 10^6</rasd:AllocationUnits>
+                  <rasd:Description>Number of virtual CPUs</rasd:Description>
+                  <rasd:ElementName>2 virtual CPU(s)</rasd:ElementName>
+                  <rasd:InstanceID>1</rasd:InstanceID>
+                  <rasd:ResourceType>3</rasd:ResourceType>
+                  <rasd:VirtualQuantity>2</rasd:VirtualQuantity>
+                </Item>
+
+                <Item>
+                  <rasd:AllocationUnits>byte * 2^20</rasd:AllocationUnits>
+                  <rasd:Description>Memory Size</rasd:Description>
+                  <rasd:ElementName>1024MB of memory</rasd:ElementName>
+                  <rasd:InstanceID>2</rasd:InstanceID>
+                  <rasd:ResourceType>4</rasd:ResourceType>
+                  <rasd:VirtualQuantity>1024</rasd:VirtualQuantity>
+                </Item>
+
+                <Item>
+                  <rasd:Address>0</rasd:Address>
+                  <rasd:Description>SCSI Controller</rasd:Description>
+                  <rasd:ElementName>SCSI Controller 0</rasd:ElementName>
+                  <rasd:InstanceID>3</rasd:InstanceID>
+                  <rasd:ResourceSubType>lsilogic</rasd:ResourceSubType>
+                  <rasd:ResourceType>6</rasd:ResourceType>
+                </Item>
+
+                <Item>
+                  <rasd:AddressOnParent>0</rasd:AddressOnParent>
+                  <rasd:ElementName>Hard disk 1</rasd:ElementName>
+                  <rasd:HostResource>ovf:/disk/vmdisk1</rasd:HostResource>
+                  <rasd:InstanceID>4</rasd:InstanceID>
+                  <rasd:Parent>3</rasd:Parent>
+                  <rasd:ResourceType>17</rasd:ResourceType>
+                </Item>
+
+                <Item>
+                  <rasd:AddressOnParent>7</rasd:AddressOnParent>
+                  <rasd:AutomaticAllocation>true</rasd:AutomaticAllocation>
+                  <rasd:Connection>LAN</rasd:Connection>
+                  <rasd:Description>E1000e ethernet adapter</rasd:Description>
+                  <rasd:ElementName>Network adapter 1</rasd:ElementName>
+                  <rasd:InstanceID>5</rasd:InstanceID>
+                  <rasd:ResourceSubType>E1000e</rasd:ResourceSubType>
+                  <rasd:ResourceType>10</rasd:ResourceType>
+                </Item>
+          ${FIRMWARE_ITEM}
+              </VirtualHardwareSection>
+            </VirtualSystem>
+          </Envelope>
+          EOF_OVF
+
+          xmllint --noout "${OVF}"
+
+      - name: Package OVA, ISO bundle, metadata, and checksums
+        id: package
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          VERSION="${{ steps.resolve.outputs.version }}"
+          BOOT_MODE="${{ steps.resolve.outputs.boot_mode }}"
+          VM_NAME="openwrt-${VERSION}-x86-64-${BOOT_MODE}"
+
+          mv "dist/openwrt-${VERSION}-x86-64-${BOOT_MODE}.vmdk" "dist/${VM_NAME}.vmdk"
+
+          cd dist
+
+          sha256sum "${VM_NAME}.ovf" "${VM_NAME}.vmdk" > "${VM_NAME}.mf"
+
+          tar -cvf "${VM_NAME}.ova" \
+            "${VM_NAME}.ovf" \
+            "${VM_NAME}.vmdk" \
+            "${VM_NAME}.mf"
+
+          cat > "metadata.json" <<EOF_METADATA
+          {
+            "name": "${VM_NAME}",
+            "openwrt_version": "${VERSION}",
+            "target": "${TARGET}",
+            "boot_mode": "${BOOT_MODE}",
+            "source_image": "${{ steps.resolve.outputs.image_url }}",
+            "source_sha256sums": "${{ steps.resolve.outputs.sha256sums_url }}",
+            "virtual_size_bytes": ${{ steps.disk.outputs.virtual_size_bytes }},
+            "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "github_repository": "${{ github.repository }}",
+            "github_run_id": "${{ github.run_id }}",
+            "github_sha": "${{ github.sha }}"
+          }
+          EOF_METADATA
+
+          xorriso -as mkisofs \
+            -iso-level 3 \
+            -full-iso9660-filenames \
+            -volid "OPENWRT_OVF" \
+            -output "${VM_NAME}-bundle.iso" \
+            "${VM_NAME}.ovf" \
+            "${VM_NAME}.vmdk" \
+            "${VM_NAME}.mf" \
+            "metadata.json"
+
+          sha256sum \
+            "${VM_NAME}.ovf" \
+            "${VM_NAME}.vmdk" \
+            "${VM_NAME}.mf" \
+            "${VM_NAME}.ova" \
+            "${VM_NAME}-bundle.iso" \
+            "metadata.json" \
+            > SHA256SUMS
+
+          echo "vm_name=${VM_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "tag=openwrt-${VERSION}-${BOOT_MODE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.vm_name }}
+          path: |
+            dist/*.ovf
+            dist/*.vmdk
+            dist/*.mf
+            dist/*.ova
+            dist/*.iso
+            dist/metadata.json
+            dist/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.package.outputs.tag }}
+          name: OpenWrt ${{ steps.resolve.outputs.version }} VMware Template ${{ steps.resolve.outputs.boot_mode }}
+          body: |
+            Automated OpenWrt x86/64 VMware template build.
+
+            Source image:
+            ${{ steps.resolve.outputs.image_url }}
+
+            Assets:
+
+            - `.ova` VMware/Open Virtualization Archive
+            - `.ovf` OVF descriptor
+            - `.vmdk` VMware disk image
+            - `.iso` ISO bundle containing OVF/VMDK metadata
+            - `metadata.json`
+            - `SHA256SUMS`
+
+            Defaults:
+
+            - Guest OS: Other Linux 4.x or later kernel 64-bit
+            - CPU: 2 vCPU
+            - RAM: 1024 MB
+            - NIC: E1000e
+            - Disk controller: LSI Logic
+            - Boot mode: ${{ steps.resolve.outputs.boot_mode }}
+          files: |
+            dist/*.ovf
+            dist/*.vmdk
+            dist/*.mf
+            dist/*.ova
+            dist/*.iso
+            dist/metadata.json
+            dist/SHA256SUMS
+          draft: false
+          prerelease: ${{ github.event.inputs.prerelease || false }}
+          fail_on_unmatched_files: true
