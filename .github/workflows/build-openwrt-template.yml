@@ -343,7 +343,7 @@ jobs:
           BOOT_MODE="${{ steps.resolve.outputs.boot_mode }}"
           VM_NAME="openwrt-${VERSION}-x86-64-${BOOT_MODE}"
 
-          mv "dist/openwrt-${VERSION}-x86-64-${BOOT_MODE}.vmdk" "dist/${VM_NAME}.vmdk"
+          
 
           cd dist
 
